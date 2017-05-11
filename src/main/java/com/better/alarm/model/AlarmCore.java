@@ -17,20 +17,8 @@
 
 package com.better.alarm.model;
 
-import java.text.DateFormat;
-import java.text.SimpleDateFormat;
-import java.util.Calendar;
-import java.util.Locale;
-import java.util.WeakHashMap;
-
-import android.content.Context;
-import android.content.Intent;
-import android.content.SharedPreferences;
-import android.content.SharedPreferences.OnSharedPreferenceChangeListener;
 import android.net.Uri;
-import android.preference.PreferenceManager;
 
-import com.better.alarm.R;
 import com.better.alarm.model.interfaces.Alarm;
 import com.better.alarm.model.interfaces.AlarmEditor;
 import com.better.alarm.model.interfaces.AlarmEditor.AlarmChangeData;
@@ -44,12 +32,20 @@ import com.github.androidutils.statemachine.Message;
 import com.github.androidutils.statemachine.State;
 import com.github.androidutils.statemachine.StateMachine;
 
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Locale;
+
+import io.reactivex.Observable;
+import io.reactivex.functions.Consumer;
+
 /**
  * Alarm is a class which models a real word alarm. It is a simple state
  * machine. External events (e.g. user input {@link #snooze()} or
  * {@link #dismiss()}) or timer events {@link #onAlarmFired(CalendarType)}
  * trigger transitions. Alarm notifies listeners when transitions happen by
- * broadcasting {@link Intent}s listed in {@link Intents}, e.g.
+ * broadcasting Intents listed in {@link Intents}, e.g.
  * {@link Intents#ALARM_PREALARM_ACTION} or {@link Intents#ALARM_DISMISS_ACTION}
  * . State and properties of the alarm are stored in the database and are
  * updated every time when changes to alarm happen.
@@ -102,71 +98,52 @@ import com.github.androidutils.statemachine.StateMachine;
  */
 public final class AlarmCore implements Alarm {
 
+    //context.getString(R.string.default_label)
+    private final String defaultLabel = "";
+
     /**
      * Strategy used to notify other components about alarm state.
      */
     public interface IStateNotifier {
-        public void broadcastAlarmState(int id, String action);
+        void broadcastAlarmState(int id, String action);
 
-        public void broadcastAlarmState(int id, String action, long millis);
-
+        void broadcastAlarmState(int id, String action, long millis);
     }
 
     private final IAlarmsScheduler mAlarmsScheduler;
     private final Logger log;
-    private final Context mContext;
-
     private final IStateNotifier broadcaster;
-
     private final IAlarmContainer container;
-
-    /**
-     * Used to calculate calendars. Is not synced with DB, because it is in the
-     * settings
-     */
-    private int prealarmMinutes;
-
     private final AlarmStateMachine stateMachine;
-
     private final DateFormat df;
 
-    public AlarmCore(IAlarmContainer container, Context context, Logger logger, IAlarmsScheduler alarmsScheduler,
-                     IStateNotifier broadcaster, HandlerFactory handlerFactory) {
-        mContext = context;
+     private final Observable<Integer> preAlarmDuration;
+     private final Observable<Integer> snoozeDuration;
+     private final Observable<Integer> autoSilence;
+
+    public AlarmCore(IAlarmContainer container, Logger logger, IAlarmsScheduler alarmsScheduler,
+                     IStateNotifier broadcaster, HandlerFactory handlerFactory, Observable<Integer> preAlarmDuration, Observable<Integer> snoozeDuration, Observable<Integer> autoSilence) {
         this.log = logger;
         mAlarmsScheduler = alarmsScheduler;
         this.container = container;
         this.broadcaster = broadcaster;
         this.df = new SimpleDateFormat("dd-MM-yy HH:mm:ss", Locale.GERMANY);
 
-        PreferenceManager.getDefaultSharedPreferences(mContext).registerOnSharedPreferenceChangeListener(
-                mOnSharedPreferenceChangeListener);
+        this.preAlarmDuration = preAlarmDuration;
+        this.snoozeDuration = snoozeDuration;
+        this.autoSilence = autoSilence;
 
         stateMachine = new AlarmStateMachine(container.getState(), "Alarm " + container.getId(), handlerFactory);
         // we always resume SM. This means that initial state will not receive
         // enter(), only resume()
         stateMachine.resume();
-        fetchPreAlarmMinutes();
-    }
 
-    /**
-     * Reference to a listener. We cannot use anonymous classes because
-     * {@link PreferenceManager} stores {@link OnSharedPreferenceChangeListener}
-     * in a {@link WeakHashMap}.
-     */
-    private final OnSharedPreferenceChangeListener mOnSharedPreferenceChangeListener = new OnSharedPreferenceChangeListener() {
-        @Override
-        public void onSharedPreferenceChanged(SharedPreferences sharedPreferences, String key) {
-            if (key.equals("prealarm_duration")) {
-                fetchPreAlarmMinutes();
+        preAlarmDuration.subscribe(new Consumer() {
+            @Override
+            public void accept(Object o) throws Exception {
                 stateMachine.sendMessage(AlarmStateMachine.PREALARM_DURATION_CHANGED);
             }
-        }
-    };
-
-    private void fetchPreAlarmMinutes() {
-        String asString = PreferenceManager.getDefaultSharedPreferences(mContext).getString("prealarm_duration", "30");
-        prealarmMinutes = Integer.parseInt(asString);
+        });
     }
 
     /** SM to handle Alarm states */
@@ -323,7 +300,7 @@ public final class AlarmCore implements Alarm {
             @Override
             public void performComplexTransition() {
                 if (container.getDaysOfWeek().isRepeatSet()) {
-                    if (container.isPrealarm() && prealarmMinutes != -1) {
+                    if (container.isPrealarm() && preAlarmDuration.blockingFirst() != -1) {
                         transitionTo(preAlarmSet);
                     } else {
                         transitionTo(set);
@@ -346,8 +323,9 @@ public final class AlarmCore implements Alarm {
             @Override
             public void performComplexTransition() {
                 Calendar preAlarm = calculateNextTime();
-                preAlarm.add(Calendar.MINUTE, -1 * prealarmMinutes);
-                if (container.isPrealarm() && preAlarm.after(Calendar.getInstance()) && prealarmMinutes != -1) {
+                Integer preAlarmMinutes = preAlarmDuration.blockingFirst();
+                preAlarm.add(Calendar.MINUTE, -1 * preAlarmMinutes);
+                if (container.isPrealarm() && preAlarm.after(Calendar.getInstance()) && preAlarmMinutes != -1) {
                     transitionTo(preAlarmSet);
                 } else {
                     transitionTo(set);
@@ -393,8 +371,7 @@ public final class AlarmCore implements Alarm {
             @Override
             public void enter() {
                 broadcastAlarmState(Intents.ALARM_ALERT_ACTION);
-                int autoSilenceMinutes = Integer.parseInt(PreferenceManager.getDefaultSharedPreferences(mContext)
-                        .getString("auto_silence", "10"));
+                int autoSilenceMinutes = autoSilence.blockingFirst();
                 if (autoSilenceMinutes > 0) {
                     // -1 means OFF
                     Calendar nextTime = Calendar.getInstance();
@@ -453,8 +430,7 @@ public final class AlarmCore implements Alarm {
 
             private Calendar getNextRegualarSnoozeCalendar() {
                 Calendar nextTime = Calendar.getInstance();
-                int snoozeMinutes = Integer.parseInt(PreferenceManager.getDefaultSharedPreferences(mContext).getString(
-                        "snooze_duration", "10"));
+                int snoozeMinutes = snoozeDuration.blockingFirst();
                 nextTime.add(Calendar.MINUTE, snoozeMinutes);
                 return nextTime;
             }
@@ -495,7 +471,7 @@ public final class AlarmCore implements Alarm {
             @Override
             public void resume() {
                 Calendar c = calculateNextTime();
-                c.add(Calendar.MINUTE, -1 * prealarmMinutes);
+                c.add(Calendar.MINUTE, -1 * preAlarmDuration.blockingFirst());
                 // since prealarm is before main alarm, it can be already in the
                 // past, so it has to be adjusted.
                 advanceCalendar(c);
@@ -884,9 +860,9 @@ public final class AlarmCore implements Alarm {
     }
 
     @Override
-    public String getLabelOrDefault(Context context) {
+    public String getLabelOrDefault() {
         if (container.getLabel() == null || container.getLabel().length() == 0)
-            return context.getString(R.string.default_label);
+            return defaultLabel;
         return container.getLabel();
     }
 

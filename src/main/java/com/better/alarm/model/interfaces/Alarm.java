@@ -51,7 +51,7 @@ public interface Alarm {
 
     public boolean isSnoozed();
 
-    public String getLabelOrDefault(Context context);
+    public String getLabelOrDefault();
 
     /**
      * @deprecated
